@@ -860,8 +860,10 @@ def main():
     total_del, cur = 0, None
     while True:
         params = {"page_size": 100}
+        # 用能唯一命中幸存记录 A/a2（"... A del-a"）的子串翻页统计：
+        # 被删的 B/b1（"... B del-b"）不含该子串，应恰好剩 1 条。
         params["q" if cur is None else "cursor"] = (
-            f"{dtok} del" if cur is None else cur)
+            f"{dtok} A del" if cur is None else cur)
         body = c.get("/logs/search", params=params).json()
         total_del += len(body["items"])
         cur = body["next_cursor"]
@@ -970,7 +972,11 @@ def main():
           [(i["batch_id"], i["id"]) for i in body["items"]]
           == [(newest, "new1")], body)
 
-    # 删光范围内全部批次：旧游标续页安全返回空，新批次仍不混入
+    # 删光范围内全部批次：旧游标续页安全返回空，新批次仍不混入。
+    # 上一步上传的 newest（n999）此前只用于“新查询可见”校验，仍在快照将覆盖
+    # 的范围内，这里先把它与 cb1 一并删除，范围才真正清空。
+    r = c.delete(f"{BASE}/batches/{newest}")
+    check("delete newest fixture batch before delete-all -> 200", r.status_code == 200)
     body = c.get("/logs/search",
                  params={"q": curtok, "page_size": 1}).json()
     snap_cur = body["next_cursor"]
@@ -1055,9 +1061,20 @@ def main():
     check("in-flight download finished 200",
           dl_state.get("status") == 200 and "e" not in dl_state,
           str(dl_state.get("e")))
+    # 下载是重新压缩并以紧凑 JSON 逐行输出（无 ":"/"," 后空格），与上传夹具
+    # 默认 json.dumps 的字节不同；按逐行 JSON 语义核对“原顺序的全部旧记录”，
+    # 并确认末行带换行、gzip CRC/ISIZE 尾部完整（gzip.decompress 已校验）。
+    dl_records_semantic = [
+        json.loads(l) for l in dl_state.get("raw", b"").decode("utf-8").splitlines()
+    ]
+    expected_records = [
+        json.loads(l) for l in dd_payload.decode("utf-8").splitlines()
+    ]
     check("download after concurrent delete keeps all pre-delete records",
-          dl_state.get("raw") == dd_payload,
-          f"match={dl_state.get('raw') == dd_payload}")
+          dl_state.get("raw", b"").endswith(b"\n")
+          and dl_records_semantic == expected_records
+          and len(dl_records_semantic) == 3000,
+          f"got={len(dl_records_semantic)} expected=3000")
 
     # 删除已完成：随后读行/下载/再删都是 404
     check("lines 404 after delete",

@@ -103,9 +103,14 @@ CRC32 与 ISIZE 结束尾部（`gzip -t` 可验）。
 短查询（WAL 下读不阻塞写），慢下载只阻塞自己的响应协程，不阻塞另一批
 上传提交，**也不阻塞删除该批次**：即使下载进行中批次被永久删除，已经
 发出 200 的下载仍按快照输出删除前的全部记录（顺序不变）并写出完整
-CRC32/ISIZE 尾部；删除完成后新发起的下载返回 `404`。下载正常结束或
-客户端中途断连时都会提交/回滚事务、关闭连接并释放快照，删除随后即可
-回收对应的 WAL 空间。
+CRC32/ISIZE 尾部；删除完成后新发起的下载返回 `404`。
+
+**资源确定性释放（不依赖垃圾回收）**：下载在响应前固定快照，正常完成、
+客户端断连、请求取消或向客户端发送失败的任一退出路径，都会及时结束只读
+事务、关闭游标与连接并释放 WAL 快照——**即使正文一次都还没开始迭代**。
+释放由两道幂等的收尾保证：响应体生成器的 `finally` 负责已开始迭代后的
+即时释放；响应的 `BackgroundTask` 与响应对象在异常退出时的收尾负责首次
+迭代前终止的兜底。重复清理安全无副作用，删除随后即可回收对应的 WAL 空间。
 
 ### `GET /logs/search` — 按 message 检索日志
 
@@ -464,6 +469,70 @@ curl -sS -o /dev/null -w '%{http_code}\n' -G http://localhost:8000/logs/search \
 
 任何失败的上传都不会产生可查询批次：随后 `GET /batches` 中不会出现它。
 
+## 下载资源交接核对
+
+下载快照（只读事务/游标/连接）在四种终止路径下都必须**确定性**释放，不能
+等循环垃圾回收；而“正文首次迭代前终止”只能在服务进程内观察。仓库内置
+一个可执行核对脚本，它直接驱动 ASGI 应用并在全程 **禁用自动循环垃圾回收**
+（`gc.disable()`）下逐条断言：
+
+1. **零次迭代终止**：200 响应头已发出、正文一个字节都没产出时取消；
+2. **开始后取消**：已产出首个 gzip 压缩块后取消；
+3. **正常结束**：完整下载并核对全部行顺序、末行换行与 gzip CRC/ISIZE 尾部；
+4. **发送失败**：分别在发响应头、发首块正文时模拟发送抛错。
+
+每条路径都核对读事务已结束、连接已关闭，重复 `release()` 不报错；随后
+制造 WAL 增长并执行 `PRAGMA wal_checkpoint(TRUNCATE)`，断言不返回 busy，
+证明读快照确已释放。脚本还核对**删除中的下载内容完整**（200 已发后删除，
+进行中的下载仍输出删除前全部 3000 行的原顺序记录与完整 gzip 尾部），以及
+删除完成后的新下载为 404。
+
+```bash
+pip install -r app/requirements.txt   # 进程内核对仅需 fastapi/uvicorn（含 anyio）
+python tests/test_download_release.py
+# 27 passed, 0 failed: []
+```
+
+> 下面的 HTTP 端到端脚本 `tests/check_api.py` 另外需要 `httpx`
+> （`pip install httpx`）。
+
+完整 HTTP 端到端核对（含慢下载中删除、断连后删除即时成功）需先启动服务：
+
+```bash
+# 方式一：Docker Compose 一键启动（见下）
+docker compose up --build
+CHECK_DB_PATH=<宿主机上的数据卷挂载路径>/batches.db \
+  BASE=http://localhost:8000 python tests/check_api.py
+
+# 方式二：本地起 uvicorn
+export DB_PATH=./data/batches.db
+python -m app.init_db
+uvicorn app.main:app --host 127.0.0.1 --port 8011 &
+CHECK_DB_PATH=./data/batches.db BASE=http://127.0.0.1:8011 \
+  python tests/check_api.py
+# 228 passed, 0 failed: []
+```
+
+用一个小的原始 socket 脚本核对“零次迭代断连后删除即时成功”：建立 TCP、
+发完 GET 立即用 RST 关闭（不读任何响应，模拟正文开始前断连），反复几次后
+删除应立即 200，不被遗留快照拖延：
+
+```bash
+BID=<一个已存在的批次 ID>
+python - "$BID" <<'PY'
+import socket, struct, sys, time
+bid = sys.argv[1]
+for _ in range(5):
+    s = socket.create_connection(("127.0.0.1", 8000))
+    s.sendall(f"GET /batches/{bid}/download HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    s.close()
+    time.sleep(0.1)
+PY
+curl -sS -w '\n%{http_code}\n' -X DELETE "http://localhost:8000/batches/$BID"
+# {"batch_id":"…","line_count":N}  随后 200（立即返回，不等待、不报数据库忙）
+```
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -480,10 +549,12 @@ app/
   config.py     # 字节限制等配置
   db.py         # SQLite 主库 + 每批次独立暂存库、原子发布/删除、旧表迁移、键集分页读取
   ingest.py     # 流式 gzip/NDJSON 解析器（有界内存、立即超限、整批原子）
-  download.py   # 流式 gzip NDJSON 下载器（删除前快照、逐页读、逐块压缩、不攒整批）
+  download.py   # 流式 gzip NDJSON 下载器（删除前快照、逐页读、逐块压缩、不攒整批、
+                #   读事务/游标/连接在所有退出路径上确定性释放）
   main.py       # FastAPI 路由
   init_db.py    # 数据库初始化入口
 Dockerfile
 docker-compose.yml
-tests/check_api.py  # 端到端检查（需先启动服务）
+tests/check_api.py              # HTTP 端到端检查（需先启动服务）
+tests/test_download_release.py  # 下载资源交接核对（禁用循环 GC；可直接运行）
 ```

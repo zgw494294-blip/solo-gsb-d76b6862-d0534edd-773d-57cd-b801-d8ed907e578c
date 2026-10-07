@@ -7,8 +7,10 @@ import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any
 
+from anyio import CancelScope, to_thread
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from . import db, download, ingest
 from .ingest import IngestError, PayloadTooLarge
@@ -114,6 +116,37 @@ def get_batch_lines(
         )
 
 
+class _DownloadResponse(StreamingResponse):
+    """下载响应：任何生命周期退出路径都释放快照资源。
+
+    正常完成、断连或取消使 ``__call__`` 正常返回时，Starlette 执行
+    BackgroundTask（snapshot.release）兜底；但发送失败（send 抛异常，例如
+    底层连接已关闭导致写失败）会让异常直接传出 ``__call__``，BackgroundTask
+    不会执行，正文迭代器也可能还开着。这里在屏蔽取消的作用域内先关闭迭代器
+    （已开始的生成器其 finally 会即时释放），再直接 release（未开始时由它
+    兜底），随后原样抛回异常。release 幂等，与 BackgroundTask 重复不报错。
+    """
+
+    def __init__(self, snapshot: "download.Snapshot", **kwargs: Any) -> None:
+        self._snapshot = snapshot
+        super().__init__(**kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:  # type: ignore[override]
+        try:
+            await super().__call__(scope, receive, send)
+        except BaseException:
+            with CancelScope(shield=True):
+                aclose = getattr(self.body_iterator, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except BaseException:
+                        # 生成器关闭过程中的次生异常不能掩盖原始异常
+                        pass
+                await to_thread.run_sync(self._snapshot.release)
+            raise
+
+
 @app.get("/batches/{batch_id}/download")
 def download_batch(batch_id: str) -> StreamingResponse:
     """把已提交批次下载为单个完整 gzip NDJSON 流。
@@ -123,13 +156,21 @@ def download_batch(batch_id: str) -> StreamingResponse:
     固定 WAL 快照，确认后才返回 StreamingResponse。这样一旦 200 响应头
     已发出，即使下载进行中该批次被 DELETE 永久删除，流内仍按原顺序输出
     删除前的全部记录并写出完整 gzip CRC/ISIZE 尾部；而 WAL 下读不阻塞写，
-    慢下载不阻塞删除或另一批上传提交，下载结束/断连即提交事务释放快照。
-    成功时 Content-Type 为 application/gzip，且不设置 Content-Encoding
-    （gzip 是文件内容本身，不是传输层编码，客户端会原样保存）。
+    慢下载不阻塞删除或另一批上传提交。
+
+    快照在响应前固定，但其释放不能只依赖响应体生成器的 finally：正文首次
+    迭代前若客户端断连或请求被取消，异步生成器从未进入，finally 不会执行，
+    连接（连同读事务/游标/WAL 快照）只能等垃圾回收。因此把同一个幂等的
+    snapshot.release 登记为响应的 BackgroundTask：响应正常结束、断连或取消
+    后 Starlette 都会执行它，即使正文一次都没迭代；生成器 finally 负责迭代
+    已开始后的即时释放，两条路径重复执行也安全。成功时 Content-Type 为
+    application/gzip，且不设置 Content-Encoding（gzip 是文件内容本身，不是
+    传输层编码，客户端会原样保存）。
     """
     conn = db.open_download_snapshot(batch_id)
     if conn is None:
         raise HTTPException(status_code=404, detail="batch not found")
+    snapshot = download.Snapshot(conn, batch_id)
 
     # batch_id 为 32 位十六进制（uuid4.hex），放入 Content-Disposition
     # 无需考虑引号或非 ASCII 转义。
@@ -138,10 +179,14 @@ def download_batch(batch_id: str) -> StreamingResponse:
             f'attachment; filename="batch-{batch_id}.json.gz"'
         )
     }
-    return StreamingResponse(
-        download.gzip_ndjson_stream(conn, batch_id),
+    return _DownloadResponse(
+        snapshot,
+        content=download.gzip_ndjson_stream(snapshot),
         media_type="application/gzip",
         headers=headers,
+        # 最终兜底：即使正文在首次迭代前就终止（生成器从未进入、其 finally
+        # 不执行），响应收尾也会释放读事务、游标与连接；release 幂等。
+        background=BackgroundTask(snapshot.release),
     )
 
 
