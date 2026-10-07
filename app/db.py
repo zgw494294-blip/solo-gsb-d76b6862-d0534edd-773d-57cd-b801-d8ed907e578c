@@ -12,8 +12,9 @@
 
 下载在开始响应（发出 200 响应头）前即进入一个显式只读事务固定 WAL 快照：
 随后删除该批次不会打断已在进行的下载（快照里仍是删除前的完整内容），而
-WAL 下读事务不阻塞写，删除也不会被慢下载阻塞；下载结束（含断连）即提交/
-回滚该事务并关闭连接，持有的快照随之释放。
+WAL 下读事务不阻塞写，删除也不会被慢下载阻塞；下载结束（正常完成、断连、
+取消、发送失败，含正文尚未开始即终止）即提交/回滚该事务并关闭连接，持有
+的快照随之释放，不依赖垃圾回收。
 
 连接使用 autocommit（isolation_level=None），事务边界显式控制。
 """
@@ -201,8 +202,9 @@ def open_download_snapshot(batch_id: str) -> sqlite3.Connection:
     逐页读取，gzip CRC/ISIZE 尾部照常生成。未知/已删除批次返回 None（此时
     尚未开始任何事务，连接直接关闭，由路由返回 404）。
 
-    返回的连接由下载流持有：正常结束时 COMMIT、异常或客户端断连时
-    ROLLBACK/关闭，快照随即释放。
+    返回的连接由下载流（download.GzipNdjsonDownload）持有：正常结束、
+    出错、客户端断连或正文尚未开始即终止，都会 COMMIT/ROLLBACK 并关闭
+    连接，快照随即释放（见 download.SnapshotStreamingResponse）。
     """
     conn = connect()
     try:
@@ -240,9 +242,10 @@ def iter_batch_lines(
     """键集分页取一批行：seq > after_seq 的至多 page_size 行，按 seq 升序。
 
     每次调用是独立短查询（WAL 下只瞬间持有读锁），不缓存整批、不跨页持有
-    事务；调用方用完一页再取一页，下载因此与其他批次的上传提交并发进行。
+    事务；游标取完一页即显式关闭，不依赖垃圾回收。调用方用完一页再取一页，
+    下载因此与其他批次的上传提交并发进行。
     """
-    return conn.execute(
+    cur = conn.execute(
         """
         SELECT seq, id, message
         FROM lines
@@ -251,7 +254,11 @@ def iter_batch_lines(
         LIMIT ?
         """,
         (batch_id, after_seq, page_size),
-    ).fetchall()
+    )
+    try:
+        return cur.fetchall()
+    finally:
+        cur.close()
 
 
 def committed_boundary(conn: sqlite3.Connection) -> int:

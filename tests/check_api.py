@@ -813,8 +813,9 @@ def main():
     dtok = f"delmark{uuid.uuid4().hex[:10]}"
 
     def upload_delete_batch(rows, tag):
+        # 消息里 dtok 与 del/keep 词相邻（tag 放末尾），检索词才能按字面命中
         payload = ndjson(
-            [{"id": i, "message": f"{dtok} {tag} {m}"} for i, m in rows])
+            [{"id": i, "message": f"{dtok} {m} {tag}"} for i, m in rows])
         r = c.post("/batches", content=gz(payload))
         check(f"delete fixture {tag} upload -> 201",
               r.status_code == 201, r.text[:120])
@@ -970,12 +971,16 @@ def main():
           [(i["batch_id"], i["id"]) for i in body["items"]]
           == [(newest, "new1")], body)
 
-    # 删光范围内全部批次：旧游标续页安全返回空，新批次仍不混入
+    # 删光范围内全部批次：旧游标续页安全返回空，新批次仍不混入。
+    # 注意上一节上传的 new1 在本次首页之前已提交，同样落在游标范围内，
+    # "删光"需把它一并删除；after-all 在首页之后才上传，不落入范围。
     body = c.get("/logs/search",
                  params={"q": curtok, "page_size": 1}).json()
     snap_cur = body["next_cursor"]
     r = c.delete(f"{BASE}/batches/{cb1}")
     check("delete last remaining fixture batch -> 200", r.status_code == 200)
+    r = c.delete(f"{BASE}/batches/{newest}")
+    check("delete in-range new1 batch -> 200", r.status_code == 200)
     r = c.post("/batches", content=gz(ndjson(
         [{"id": "after-all", "message": f"{curtok} n1000 after-delete-all"}])))
     check("upload after delete-all -> 201", r.status_code == 201)
@@ -984,10 +989,17 @@ def main():
           body["items"] == [] and body["next_cursor"] is None, body)
 
     print("== 删除与进行中的慢下载 ==")
-    dd_payload = b"".join(
-        json.dumps({"id": f"dd{i:06d}",
-                    "message": os.urandom(200).hex()}).encode() + b"\n"
+    dd_records = [
+        {"id": f"dd{i:06d}", "message": os.urandom(200).hex()}
         for i in range(3000)
+    ]
+    dd_payload = b"".join(json.dumps(r).encode() + b"\n" for r in dd_records)
+    # 下载输出的是紧凑分隔符 NDJSON（记录均为 ASCII，ensure_ascii 无差别），
+    # 与上传时的默认分隔符字节不同，核对内容须用同一序列化形式
+    dd_expected = b"".join(
+        json.dumps(r, ensure_ascii=False, separators=(",", ":")).encode()
+        + b"\n"
+        for r in dd_records
     )
     r = c.post("/batches", content=gz(dd_payload))
     check("slow-download-delete fixture -> 201",
@@ -1056,8 +1068,8 @@ def main():
           dl_state.get("status") == 200 and "e" not in dl_state,
           str(dl_state.get("e")))
     check("download after concurrent delete keeps all pre-delete records",
-          dl_state.get("raw") == dd_payload,
-          f"match={dl_state.get('raw') == dd_payload}")
+          dl_state.get("raw") == dd_expected,
+          f"match={dl_state.get('raw') == dd_expected}")
 
     # 删除已完成：随后读行/下载/再删都是 404
     check("lines 404 after delete",

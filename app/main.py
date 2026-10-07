@@ -123,7 +123,9 @@ def download_batch(batch_id: str) -> StreamingResponse:
     固定 WAL 快照，确认后才返回 StreamingResponse。这样一旦 200 响应头
     已发出，即使下载进行中该批次被 DELETE 永久删除，流内仍按原顺序输出
     删除前的全部记录并写出完整 gzip CRC/ISIZE 尾部；而 WAL 下读不阻塞写，
-    慢下载不阻塞删除或另一批上传提交，下载结束/断连即提交事务释放快照。
+    慢下载不阻塞删除或另一批上传提交。快照连接的释放由
+    SnapshotStreamingResponse 保证：正常结束、断连、取消、发送失败
+    （含正文尚未开始）都会及时结束读事务并关闭连接，不依赖垃圾回收。
     成功时 Content-Type 为 application/gzip，且不设置 Content-Encoding
     （gzip 是文件内容本身，不是传输层编码，客户端会原样保存）。
     """
@@ -138,8 +140,9 @@ def download_batch(batch_id: str) -> StreamingResponse:
             f'attachment; filename="batch-{batch_id}.json.gz"'
         )
     }
-    return StreamingResponse(
-        download.gzip_ndjson_stream(conn, batch_id),
+    stream = download.GzipNdjsonDownload(conn, batch_id)
+    return download.SnapshotStreamingResponse(
+        stream,
         media_type="application/gzip",
         headers=headers,
     )
